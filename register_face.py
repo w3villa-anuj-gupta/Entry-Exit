@@ -1,30 +1,32 @@
-import sys
-import sqlite3
 import cv2
+import threading
 import mediapipe as mp
 import torch
 from facenet_pytorch import InceptionResnetV1
 import numpy as np
+import sqlite3
+from datetime import datetime
 from numpy.linalg import norm
 
 # -----------------------------
-# Helper: cosine similarity
+# Global variables
+# -----------------------------
+frame1, frame2 = None, None
+running = True
+
+# Track person status : "Inside" or "Outside"
+person_status = {}       # {name: "Inside"/"Outside"}
+last_exit_time = {}      # {name: datetime of last exit}
+COOLDOWN = 10            # seconds
+
+# -----------------------------
+# Cosine similarity function 
 # -----------------------------
 def cosine_similarity(a, b):
     return np.dot(a, b) / (norm(a) * norm(b))
 
 # -----------------------------
-# Check command-line argument
-# -----------------------------
-if len(sys.argv) != 2:
-    print("Usage: python register_face.py <name>")
-    sys.exit(1)
-
-name = sys.argv[1]
-name = name.strip()
-
-# -----------------------------
-# Setup SQLite DB
+# Database setup
 # -----------------------------
 conn = sqlite3.connect("faces.db")
 c = conn.cursor()
@@ -34,89 +36,143 @@ CREATE TABLE IF NOT EXISTS users (
     embedding BLOB
 )
 ''')
+c.execute('''
+CREATE TABLE IF NOT EXISTS logs (
+    name TEXT,
+    event TEXT,
+    timestamp TEXT
+)
+''')
 conn.commit()
 
 # -----------------------------
-# Initialize Face Detection & FaceNet
+# FaceNet & MediaPipe setup
 # -----------------------------
 mp_face = mp.solutions.face_detection
 face_detection = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.7)
 resnet = InceptionResnetV1(pretrained='vggface2').eval()
+SIM_THRESHOLD = 0.6  # similarity threshold
 
 # -----------------------------
-# Capture face from camera
+# Thread function to grab frames
 # -----------------------------
-cap = cv2.VideoCapture(2)
-print("Looking for a face. Press 'q' to quit.")
+def grab_frames(cv2_obj, cam_id):
+    global frame1, frame2, running
+    while running:
+        ret, frame = cv2_obj.read()
+        if not ret:
+            continue
+        if cam_id == 1:
+            frame1 = frame
+        else:
+            frame2 = frame
 
-embedding = None
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to grab frame")
-        break
+# -----------------------------
+# Identify person by embedding using FaceNet
+# -----------------------------
+def identify_face(face_img):
+    if face_img.size == 0:
+        return None
+    face_tensor = torch.tensor(face_img.transpose((2,0,1)), dtype=torch.float32)
+    face_tensor = torch.nn.functional.interpolate(face_tensor.unsqueeze(0), size=(160,160))
+    face_tensor = (face_tensor / 255.0 - 0.5) / 0.5
+    with torch.no_grad():
+        emb = resnet(face_tensor).squeeze().numpy()
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_detection.process(rgb_frame)
+    # Compare with DB embeddings
+    c.execute("SELECT name, embedding FROM users")
+    rows = c.fetchall()
+    for db_name, db_emb_bytes in rows:
+        db_emb = np.frombuffer(db_emb_bytes, dtype=np.float32)
+        sim = cosine_similarity(emb, db_emb)
+        if sim > SIM_THRESHOLD:
+            return db_name
+    return None
 
-    if results.detections:
-        detection = results.detections[0]
-        bboxC = detection.location_data.relative_bounding_box
-        ih, iw, _ = frame.shape
-        x1 = int(bboxC.xmin * iw)
-        y1 = int(bboxC.ymin * ih)
-        w = int(bboxC.width * iw)
-        h = int(bboxC.height * ih)
+# -----------------------------
+# Main function for display & detection loop 
+# -----------------------------
+def display_frames():
+    global running, frame1, frame2, person_status, last_exit_time
+    while running:
+        now = datetime.now()
 
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = x1 + w, y1 + h
-        face_img = frame[y1:y2, x1:x2]
+        # --------- Entry Camera ---------
+        if frame1 is not None:
+            rgb_frame = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
+            results = face_detection.process(rgb_frame)
+            if results.detections:
+                for detection in results.detections:
+                    bboxC = detection.location_data.relative_bounding_box
+                    ih, iw, _ = frame1.shape
+                    x1 = int(bboxC.xmin * iw)
+                    y1 = int(bboxC.ymin * ih)
+                    w = int(bboxC.width * iw)
+                    h = int(bboxC.height * ih)
+                    face_img = frame1[max(0,y1):y1+h, max(0,x1):x1+w]
+                    name = identify_face(face_img)
+                    if name:
+                        # only log entry if person is outside 
+                        status = person_status.get(name, "Outside")
+                        last_exit = last_exit_time.get(name)
+                        # Only allow entry if outside and cooldown passed
+                        if status == "Outside" and (last_exit is None or (now - last_exit).total_seconds() >= COOLDOWN):
+                            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                            c.execute("INSERT INTO logs (name,event,timestamp) VALUES (?,?,?)", (name,"Entry",timestamp))
+                            conn.commit()
+                            person_status[name] = "Inside"
+                            print(f"{name} entered at {timestamp}")
+            cv2.imshow("Entry Camera", frame1)
 
-        if face_img.size != 0:
-            # Preprocess face
-            face_tensor = torch.tensor(face_img.transpose((2,0,1)), dtype=torch.float32)
-            face_tensor = torch.nn.functional.interpolate(face_tensor.unsqueeze(0), size=(160,160))
-            face_tensor = (face_tensor / 255.0 - 0.5) / 0.5
-            with torch.no_grad():
-                embedding = resnet(face_tensor).squeeze().numpy()
-            print("Face captured!")
+        # --------- Exit Camera ---------
+        if frame2 is not None:
+            rgb_frame = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
+            results = face_detection.process(rgb_frame)
+            if results.detections:
+                for detection in results.detections:
+                    bboxC = detection.location_data.relative_bounding_box
+                    ih, iw, _ = frame2.shape
+                    x1 = int(bboxC.xmin * iw)
+                    y1 = int(bboxC.ymin * ih)
+                    w = int(bboxC.width * iw)
+                    h = int(bboxC.height * ih)
+                    face_img = frame2[max(0,y1):y1+h, max(0,x1):x1+w]
+                    name = identify_face(face_img)
+                    if name:
+                        #  only log exit if the person is inside
+                        status = person_status.get(name, "Outside")
+                        if status == "Inside":
+                            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                            c.execute("INSERT INTO logs (name,event,timestamp) VALUES (?,?,?)", (name,"Exit",timestamp))
+                            conn.commit()
+                            person_status[name] = "Outside"
+                            last_exit_time[name] = now
+                            print(f"{name} exited at {timestamp}")
+            cv2.imshow("Exit Camera", frame2)
+
+        # Quit on 'q'
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            running = False
             break
 
-    cv2.imshow("Camera", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+# -----------------------------
+# Main Program
+# -----------------------------
+if __name__ == "__main__":
+    cap1 = cv2.VideoCapture(0)
+    cap2 = cv2.VideoCapture(2)
 
-cap.release()
-cv2.destroyAllWindows()
+    thread1 = threading.Thread(target=grab_frames, args=(cap1,1))
+    thread2 = threading.Thread(target=grab_frames, args=(cap2,2))
 
-if embedding is None:
-    print("No face detected. Exiting.")
+    thread1.start()
+    thread2.start()
+
+    display_frames()
+
+    thread1.join()
+    thread2.join()
+    cap1.release()
+    cap2.release()
+    cv2.destroyAllWindows()
     conn.close()
-    sys.exit(1)
-
-# -----------------------------
-# Check if person already exists by embedding
-# -----------------------------
-c.execute("SELECT name, embedding FROM users")
-rows = c.fetchall()
-threshold = 0.6  # cosine similarity threshold
-
-for db_name, db_emb_bytes in rows:
-    db_emb = np.frombuffer(db_emb_bytes, dtype=np.float32)
-    sim = cosine_similarity(embedding, db_emb)
-    if sim > threshold:
-        print(f"Face already exists in the database as '{db_name}' (similarity={sim:.2f}). Camera off.")
-        conn.close()
-        sys.exit(0)
-    elif name == db_name:
-        print(f"With This {name} face is alredy Exist")
-        sys.exit(0)
-
-# -----------------------------
-# Store embedding in DB
-# -----------------------------
-embedding_bytes = embedding.astype(np.float32).tobytes()
-c.execute("INSERT INTO users (name, embedding) VALUES (?, ?)", (name, embedding_bytes))
-conn.commit()
-conn.close()
-print(f"{name} has been registered successfully.")
