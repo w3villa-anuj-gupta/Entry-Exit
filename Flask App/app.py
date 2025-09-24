@@ -8,6 +8,8 @@ from numpy.linalg import norm
 from facenet_pytorch import InceptionResnetV1
 from datetime import datetime
 from flask import Flask, render_template, Response, request, redirect, url_for, flash,jsonify
+import time
+from datetime import datetime
 
 # -----------------------------
 # Flask setup
@@ -31,7 +33,8 @@ def init_db():
     c.execute('''
     CREATE TABLE IF NOT EXISTS users (
         name TEXT PRIMARY KEY,
-        embedding BLOB
+        embedding BLOB,
+        samples_count INT
     )
     ''')
     c.execute('''
@@ -53,13 +56,83 @@ init_db()
 mp_face = mp.solutions.face_detection
 face_detection = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.7)
 resnet = InceptionResnetV1(pretrained='vggface2').eval()
-SIM_THRESHOLD = 0.6
+SIM_THRESHOLD = 0.7
 
 # -----------------------------
 # Helper functions
 # -----------------------------
+def l2_normalize(x, eps=1e-10):
+    norm1 = norm(x)
+    if norm1 < eps:
+        return x
+    return x / norm1
+
 def cosine_similarity(a, b):
     return np.dot(a, b) / (norm(a) * norm(b))
+
+
+def average_embeddings(emb_list, remove_outliers=True, outlier_thresh=0.5):
+    """
+    emb_list: list of 1D numpy arrays (float32)
+    remove_outliers: remove samples whose cosine to initial mean < outlier_thresh
+    Returns: normalized averaged embedding (float32) or None if nothing valid
+    """
+    if not emb_list:
+        return None
+
+    # stack
+    E = np.stack(emb_list, axis=0)  # shape (N, d)
+
+    # initial mean
+    mean = np.mean(E, axis=0)
+
+    if remove_outliers and len(emb_list) > 2:
+        sims = (E @ mean) / (np.linalg.norm(E, axis=1) * np.linalg.norm(mean) + 1e-10)
+        # keep embeddings with sim >= outlier_thresh
+        keep_idx = np.where(sims >= outlier_thresh)[0]
+        if len(keep_idx) == 0:
+            # all outliers — fallback to use all
+            mean = np.mean(E, axis=0)
+        else:
+            mean = np.mean(E[keep_idx], axis=0)
+
+    mean = mean.astype(np.float32)
+    mean = l2_normalize(mean)
+    return mean
+
+# --- capture multiple samples from camera ---
+def capture_embeddings_from_camera(cap, face_detection, resnet, samples=12, timeout=12):
+    """
+    Try to capture up to `samples` good face embeddings within `timeout` seconds.
+    Returns list of numpy arrays or empty list.
+    Assumes get_embedding(face_img) exists and returns numpy array.
+    """
+    embeddings = []
+    start = time.time()
+    while len(embeddings) < samples and (time.time() - start) < timeout:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_detection.process(rgb)
+        if results.detections:
+            # pick largest face or first detection
+            # here: use first detection
+            det = results.detections[0]
+            ih, iw, _ = frame.shape
+            bboxC = det.location_data.relative_bounding_box
+            x1, y1 = int(bboxC.xmin * iw), int(bboxC.ymin * ih)
+            w, h = int(bboxC.width * iw), int(bboxC.height * ih)
+            face_img = frame[max(0,y1):y1+h, max(0,x1):x1+w]
+            if face_img.size == 0:
+                continue
+            emb = get_embedding(face_img)  # your function
+            if emb is not None:
+                embeddings.append(emb.astype(np.float32))
+        # small delay to avoid hammering
+        cv2.waitKey(50)
+    return embeddings
+
 
 def get_embedding(face_img):
     if face_img.size == 0:
@@ -204,54 +277,53 @@ def logs():
 def register():
     if request.method == "POST":
         name = request.form["name"].strip()
+        if not name:
+            flash("Name is required.", "danger")
+            return redirect(url_for("register"))
+
         cap = cv2.VideoCapture(0)
-        embedding = None
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_detection.process(rgb_frame)
-            if results.detections:
-                detection = results.detections[0]
-                ih, iw, _ = frame.shape
-                bboxC = detection.location_data.relative_bounding_box
-                x1, y1 = int(bboxC.xmin * iw), int(bboxC.ymin * ih)
-                w, h = int(bboxC.width * iw), int(bboxC.height * ih)
-                face_img = frame[max(0,y1):y1+h, max(0,x1):x1+w]
-                emb = get_embedding(face_img)
-                if emb is not None:
-                    embedding = emb
-                    break
-        cap.release()
-        cv2.destroyAllWindows()
+        try:
+            # capture multiple embeddings (e.g., 6 samples within 12s)
+            raw_embs = capture_embeddings_from_camera(cap, face_detection, resnet, samples=12, timeout=12)
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
 
-        if embedding is None:
-            flash("No face detected. Try again.",'danger')
-            return redirect(url_for('register'))
+        if not raw_embs:
+            flash("Could not detect face. Try again.", "danger")
+            return redirect(url_for("register"))
 
+        # compute averaged normalized embedding with outlier removal
+        avg_emb = average_embeddings(raw_embs, remove_outliers=True, outlier_thresh=0.5)
+        if avg_emb is None:
+            flash("Failed to compute averaged embedding.", "danger")
+            return redirect(url_for("register"))
+
+        # check duplicates (compare avg_emb against DB)
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        # check if exists
         c.execute("SELECT name, embedding FROM users")
         rows = c.fetchall()
         for db_name, db_emb_bytes in rows:
             db_emb = np.frombuffer(db_emb_bytes, dtype=np.float32)
-            sim = cosine_similarity(embedding, db_emb)
+            sim = cosine_similarity(avg_emb, db_emb)
             if sim > SIM_THRESHOLD:
-                flash(f"Face already exists as {db_name}",'danger')
-                return redirect(url_for('register'))
-            elif name == db_name:
-                flash(f"Name {name} already exists.",'danger')
-                return redirect(url_for('register'))
+                flash(f"Face already exists as {db_name} (sim={sim:.2f})", 'danger')
+                conn.close()
+                return redirect(url_for("register"))
+            if name == db_name:
+                flash(f"Name {name} already exists.", 'danger')
+                conn.close()
+                return redirect(url_for("register"))
 
-        embedding_bytes = embedding.astype(np.float32).tobytes()
-        c.execute("INSERT INTO users (name, embedding) VALUES (?, ?)", (name, embedding_bytes))
+        # store averaged embedding
+        emb_bytes = avg_emb.astype(np.float32).tobytes()
+        c.execute("INSERT INTO users (name, embedding, samples_count) VALUES (?, ?, ?)", (name, emb_bytes, len(raw_embs)))
         conn.commit()
         conn.close()
-        flash(f"{name} registered successfully!",'success')
-    return render_template("register.html")
+        flash(f"{name} registered successfully!", 'success')
 
+    return render_template("register.html")
 # -----------------------------
 # Delete Face
 # -----------------------------
