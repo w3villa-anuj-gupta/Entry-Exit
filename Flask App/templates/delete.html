@@ -10,9 +10,9 @@
 <body class="bg-light">
 
   <div class="container d-flex flex-column align-items-center justify-content-center vh-100">
-    <div class="card shadow p-4" style="max-width: 400px; width: 100%;">
+    <div class="card shadow p-4" style="max-width: 500px; width: 100%;">
       <h2 class="text-center mb-4">Delete Face</h2>
-
+      <div style="height: 90px;">
       <!-- Flash Messages -->
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
@@ -24,7 +24,7 @@
           {% endfor %}
         {% endif %}
       {% endwith %}
-      
+      </div>
       <form method="POST">
         <div class="mb-3">
           <label for="name" class="form-label">Enter Name</label>
