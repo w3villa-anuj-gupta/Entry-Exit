@@ -9,10 +9,7 @@
 </head>
 <body class="bg-light">
 
-  <div class="container d-flex flex-column align-items-center justify-content-center vh-100">
-    <div class="card shadow p-4" style="max-width: 500px; width: 100%;">
-      <h2 class="text-center mb-2">Register New User</h2>
-      <div style="height: 90px;">
+
       <!-- Flash Messages -->
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
@@ -24,21 +21,24 @@
           {% endfor %}
         {% endif %}
       {% endwith %}
-      </div>
-      <form method="POST">
-        <div class="mb-3">
-          <label for="name" class="form-label">Enter Name</label>
-          <input type="text" id="name" name="name" class="form-control" placeholder="Enter full name" required>
-        </div>
-        <button type="submit" class="btn btn-primary w-100">Register</button>
-      </form>
+    
+      <!-- Camera preview -->
+<div class="mb-3">
+  <img id="camera_feed" src="{{ url_for('register_camera_feed') }}" class="img-fluid rounded" alt="Register Camera">
+</div>
 
-      <div class="text-center mt-3">
-        <a href="/" class="btn btn-secondary w-100">⬅ Back</a>
-      </div>
+<!-- Capture buttons -->
+  <button id="capture_btn" class="btn btn-primary">Capture Embedding</button>
+  <button id="submit_btn" class="btn btn-success">Submit All 5 Embeddings</button>
+
+
+<!-- Hidden input to store embeddings -->
+<input id="name" name="embeddings_data">
+
+ <!-- Back Button -->
+    <div class="text-center mt-4">
+      <a href="{{ url_for('stop_cameras') }}" class="btn btn-secondary">⬅ Back</a>
     </div>
-  </div>
-
   <!-- Bootstrap JS -->
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <!-- <script>
@@ -51,5 +51,66 @@
       });
     }, 2000);
   </script> -->
+  <script>
+let embeddings = [];
+let captureCount = 0;
+
+document.getElementById("capture_btn").addEventListener("click", async () => {
+  if (captureCount >= 5) {
+    alert("Already captured 5 embeddings");
+    return;
+  }
+
+  const img = document.getElementById("camera_feed");
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const dataURL = canvas.toDataURL("image/jpeg");
+
+  const res = await fetch("/capture_embedding", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({image: dataURL})
+  });
+
+  const result = await res.json();
+  if (result.success) {
+    embeddings.push(result.embedding);  // embedding returned as list/array
+    captureCount++;
+    alert(`Captured embedding ${captureCount}/5`);
+  } else {
+    alert("Face not detected, try again");
+  }
+});
+
+// Submit all embeddings to save
+document.getElementById("submit_btn").addEventListener("click", async () => {
+  if (embeddings.length < 5) {
+    alert("Capture all 5 embeddings first!");
+    return;
+  }
+
+  const name = document.getElementById("name").value.trim();
+  if (!name) {
+    alert("Enter a name");
+    return;
+  }
+
+  const res = await fetch("/register_multiple", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({name, embeddings})
+  });
+
+  const result = await res.json();
+  alert(result.message);
+  if(result.success){
+    window.location.href = "/stop_cameras";  // back to home
+  }
+});
+</script>
+
 </body>
 </html>
