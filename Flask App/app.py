@@ -13,7 +13,6 @@ from io import BytesIO
 from PIL import Image
 import faiss
 import time
-import threading
 
 # -----------------------------
 # Flask setup
@@ -68,7 +67,8 @@ def load_faiss_index():
     rows = c.fetchall()
     conn.close()
 
-    index = faiss.IndexFlatL2(EMBEDDING_SIZE)
+    # ID-mapped index
+    index = faiss.IndexIDMap(faiss.IndexFlatL2(EMBEDDING_SIZE))
     ids.clear()
     names.clear()
 
@@ -77,7 +77,7 @@ def load_faiss_index():
         if emb.shape[1] != EMBEDDING_SIZE:
             print(f"⚠️ Skipping {name}, wrong dim {emb.shape[1]}")
             continue
-        index.add(emb)
+        index.add_with_ids(emb, np.array([db_id], dtype=np.int64))
         ids.append(db_id)
         names.append(name)
 
@@ -108,20 +108,21 @@ def get_embedding(face_img):
     return emb
 
 def identify_face(embedding):
-    global index, names
+    global index, names, ids
     embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
-    if embedding.shape[1] != index.d:
-        return None
     distances, indices = index.search(embedding, k=5)
     matched_names = []
     for rank, idx in enumerate(indices[0]):
         if idx == -1:
             continue
         if distances[0][rank] < SIM_THRESHOLD:
-            matched_names.append(names[idx])
+            # idx is the ID from SQLite
+            matched_names.append(names[ids.index(idx)])
     if not matched_names:
         return None
+    print("matched_names : ",matched_names)
     return max(set(matched_names), key=matched_names.count)
+
 
 def log_event(name, event):
     conn = sqlite3.connect(DB_NAME)
@@ -329,17 +330,22 @@ def register_multiple():
     if c.fetchone():
         return jsonify({"success":False,"message":f"{name} already exists"})
 
+    new_ids = []
     for emb in embeddings_list:
         emb_np = np.array(emb, dtype=np.float32).reshape(1,-1)
         emb_bytes = emb_np.tobytes()
         c.execute("INSERT INTO users (name, embedding) VALUES (?, ?)", (name, emb_bytes))
         new_id = c.lastrowid
-        index.add(emb_np)
+        # Add embedding to Faiss with its ID
+        index.add_with_ids(emb_np, np.array([new_id], dtype=np.int64))
         ids.append(new_id)
         names.append(name)
+        new_ids.append(new_id)
+
     conn.commit()
     conn.close()
-    return jsonify({"success": True, "message":f"{name} registered successfully with 5 embeddings"})
+    return jsonify({"success": True, "message":f"{name} registered successfully with IDs: {new_ids}"})
+
 
 @app.route("/register")
 def register():
@@ -350,18 +356,31 @@ def register():
 # -----------------------------
 @app.route("/delete", methods=["GET", "POST"])
 def delete():
+    global index, ids, names
     if request.method=="POST":
         name = request.form["name"].strip()
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("DELETE FROM users WHERE name=?", (name,))
-        if c.rowcount>0:
+        # Get all IDs for this user
+        c.execute("SELECT id FROM users WHERE name=?", (name,))
+        id_rows = c.fetchall()
+        if id_rows:
+            ids_to_remove = [row[0] for row in id_rows]
+            # Remove embeddings from Faiss
+            index.remove_ids(np.array(ids_to_remove, dtype=np.int64))
+            # Update parallel lists
+            ids = [i for i in ids if i not in ids_to_remove]
+            names = [n for i,n in zip(ids, names) if i not in ids_to_remove]
+            # Delete from SQLite
+            c.execute("DELETE FROM users WHERE name=?", (name,))
+            c.execute("DELETE FROM logs WHERE name=?", (name,))
             flash(f"{name} deleted successfully",'success')
         else:
             flash(f"{name} does not exist",'danger')
         conn.commit()
         conn.close()
     return render_template("delete.html")
+
 
 @app.route("/display_users")
 def display_users():
@@ -370,7 +389,8 @@ def display_users():
     c.execute("SELECT DISTINCT name FROM users")
     rows = c.fetchall()
     conn.close()
-    return render_template("display_users.html", users=rows)
+    users = [row[0] for row in rows]
+    return render_template("display_users.html", users=users)
 
 # -----------------------------
 # Run Flask
